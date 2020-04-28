@@ -7,7 +7,6 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/backup"
-	"github.com/pingcap/kvproto/pkg/import_sstpb"
 	"github.com/pingcap/log"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/pd/v4/server/schedule/placement"
@@ -178,6 +177,7 @@ func RunRestore(c context.Context, g glue.Glue, cmdName string, cfg *RestoreConf
 		}
 	}
 
+	// We make bigger errCh so we won't block on multi-part failed.
 	errCh := make(chan error, 32)
 	tableStream := client.GoCreateTables(ctx, mgr.GetDomain(), tables, newTS, errCh)
 	placementRules, err := client.GetPlacementRules(cfg.PD)
@@ -188,10 +188,8 @@ func RunRestore(c context.Context, g glue.Glue, cmdName string, cfg *RestoreConf
 	tableFileMap := restore.MapTableToFiles(files)
 	rangeStream := restore.GoValidateFileRanges(ctx, tableStream, tableFileMap, errCh)
 
-
 	rangeSize := restore.EstimateRangeSize(files)
 	summary.CollectInt("restore ranges", rangeSize)
-
 
 	// Redirect to log if there is no log file to avoid unreadable output.
 	updateCh := g.StartProgress(
@@ -221,10 +219,11 @@ func RunRestore(c context.Context, g glue.Glue, cmdName string, cfg *RestoreConf
 		batchSize = maxRestoreBatchSizeLimit // 256
 	}
 
-
 	batcher := restore.NewBatcher(ctx, client, updateCh)
 	batcher.BatchSizeThreshold = batchSize
 	afterRestoreStream := goRestore(ctx, rangeStream, placementRules, client, batcher, errCh)
+
+	newTables, _, _, err := collectRestoreResults(ctx, afterRestoreStream, errCh)
 
 	// Always run the post-work even on error, so we don't stuck in the import
 	// mode or emptied schedulers
@@ -237,30 +236,8 @@ func RunRestore(c context.Context, g glue.Glue, cmdName string, cfg *RestoreConf
 		return err
 	}
 
-	var newTables []*model.TableInfo
-	var ranges []rtree.Range
-	rewriteRules := &restore.RewriteRules{
-		Table: []*import_sstpb.RewriteRule{},
-		Data:  []*import_sstpb.RewriteRule{},
-	}
-	for ct := range afterRestoreStream {
-		newTables = append(newTables, ct.Table)
-		ranges = append(ranges, ct.Range...)
-		rewriteRules.Table = append(rewriteRules.Table, ct.RewriteRule.Table...)
-		rewriteRules.Data = append(rewriteRules.Data, ct.RewriteRule.Data...)
-	}
-	log.Debug("Go back to sequential path.",
-		zap.Int("files", len(files)),
-		zap.Int("new tables", len(newTables)),
-		zap.Int("ranges", len(ranges)))
-	select {
-	case err := <-errCh:
-		return err
-	default:
-	}
-
-
 	// Checksum
+	// TODO: add checksum to pipeline.
 	updateCh = g.StartProgress(
 		ctx, "Checksum", int64(len(newTables)), !cfg.LogProgress)
 	err = client.ValidateChecksum(
@@ -437,8 +414,29 @@ func RunRestoreTiflashReplica(c context.Context, g glue.Glue, cmdName string, cf
 	return nil
 }
 
+// collectRestoreResults collectes result of pipelined restore process,
+// block the current goroutine, until all the tasks finished.
+// TODO: remove this function when all the link
+func collectRestoreResults(
+	ctx context.Context,
+	ch <-chan restore.TableWithRange,
+	errCh <-chan error,
+) (newTables []*model.TableInfo, ranges []rtree.Range, rewriteRules *restore.RewriteRules, err error) {
+	rewriteRules = restore.EmptyRewriteRule()
+	for ct := range ch {
+		newTables = append(newTables, ct.Table)
+		ranges = append(ranges, ct.Range...)
+		rewriteRules.Table = append(rewriteRules.Table, ct.RewriteRule.Table...)
+		rewriteRules.Data = append(rewriteRules.Data, ct.RewriteRule.Data...)
+	}
+	select {
+	case err = <-errCh:
+	default:
+	}
+	return
+}
+
 // goRestore forks a goroutine to do the restore process.
-// TODO: use a struct to contain general data structs(like, client + ctx + updateCh).
 func goRestore(
 	ctx context.Context,
 	inputCh <-chan restore.TableWithRange,
@@ -452,9 +450,13 @@ func goRestore(
 		// We cache old tables so that we can 'batch' recover TiFlash and tables.
 		oldTables := []*utils.Table{}
 		newTables := []*model.TableInfo{}
-		defer close(outCh)
 		defer func() {
-			log.Info("doing postwork", 
+			// when things done, we must clean pending requests.
+			if err := batcher.Close(); err != nil {
+				errCh <- err
+				return
+			}
+			log.Info("doing postwork",
 				zap.Int("new tables", len(newTables)),
 				zap.Int("old tables", len(oldTables)),
 			)
@@ -466,42 +468,41 @@ func goRestore(
 				log.Error("failed on recover TiFlash replicas", zap.Error(err))
 				errCh <- err
 			}
+			close(outCh)
 		}()
-		for t := range inputCh {
+
+		for {
 			select {
 			case <-ctx.Done():
 				errCh <- ctx.Err()
-			default:
-			}
-			// Omit the number of TiFlash have been removed.
-			if _, err := client.RemoveTiFlashOfTable(t.CreatedTable, rules); err != nil {
-				log.Error("failed on remove TiFlash replicas", zap.Error(err))
-				errCh <- err
-				return
-			}
-			oldTables = append(oldTables, t.OldTable)
+			case t, ok := <-inputCh:
+				if !ok {
+					return
+				}
+				// Omit the number of TiFlash have been removed.
+				if _, err := client.RemoveTiFlashOfTable(t.CreatedTable, rules); err != nil {
+					log.Error("failed on remove TiFlash replicas", zap.Error(err))
+					errCh <- err
+					return
+				}
+				oldTables = append(oldTables, t.OldTable)
 
-			// Reusage of splitPrepareWork would be safe.
-			// But this operation sometime would be costly.
-			if err := splitPrepareWork(ctx, client, []*model.TableInfo{t.Table}); err != nil {
-				log.Error("failed on set online restore placement rules", zap.Error(err))
-				errCh <- err
-				return
-			}
-			newTables = append(newTables, t.Table)
+				// Reusage of splitPrepareWork would be safe.
+				// But this operation sometime would be costly.
+				if err := splitPrepareWork(ctx, client, []*model.TableInfo{t.Table}); err != nil {
+					log.Error("failed on set online restore placement rules", zap.Error(err))
+					errCh <- err
+					return
+				}
+				newTables = append(newTables, t.Table)
 
-			if err := batcher.Add(t); err != nil {
-				errCh <- err
-				return
+				if err := batcher.Add(t); err != nil {
+					errCh <- err
+					return
+				}
+
+				outCh <- t
 			}
-			
-			outCh <- t
-		}
-		
-		// when things done, we must clean pending requests.
-		if err := batcher.Close(); err != nil {
-			errCh <- err
-			return
 		}
 	}()
 	return outCh
