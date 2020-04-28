@@ -221,16 +221,8 @@ func RunRestore(c context.Context, g glue.Glue, cmdName string, cfg *RestoreConf
 		batchSize = maxRestoreBatchSizeLimit // 256
 	}
 
-	tiflashStores, err := conn.GetAllTiKVStores(ctx, client.GetPDClient(), conn.TiFlashOnly)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	rejectStoreMap := make(map[uint64]bool)
-	for _, store := range tiflashStores {
-		rejectStoreMap[store.GetId()] = true
-	}
 
-	batcher := restore.NewBatcher(ctx, client, rejectStoreMap, updateCh)
+	batcher := restore.NewBatcher(ctx, client, updateCh)
 	batcher.BatchSizeThreshold = batchSize
 	afterRestoreStream := goRestore(ctx, rangeStream, placementRules, client, batcher, errCh)
 
@@ -262,14 +254,11 @@ func RunRestore(c context.Context, g glue.Glue, cmdName string, cfg *RestoreConf
 		zap.Int("new tables", len(newTables)),
 		zap.Int("ranges", len(ranges)))
 	select {
-	case err, ok := <-errCh:
-		if ok {
-			return err
-		}
+	case err := <-errCh:
+		return err
 	default:
 	}
-	// Restore has finished.
-	updateCh.Close()
+
 
 	// Checksum
 	updateCh = g.StartProgress(
@@ -450,7 +439,6 @@ func RunRestoreTiflashReplica(c context.Context, g glue.Glue, cmdName string, cf
 
 // goRestore forks a goroutine to do the restore process.
 // TODO: use a struct to contain general data structs(like, client + ctx + updateCh).
-// NOTE: is ctx.WithValue() a good idea? It would be simpler but will broken the type-constraint.
 func goRestore(
 	ctx context.Context,
 	inputCh <-chan restore.TableWithRange,
@@ -511,7 +499,7 @@ func goRestore(
 		}
 		
 		// when things done, we must clean pending requests.
-		if err := batcher.Send(); err != nil {
+		if err := batcher.Close(); err != nil {
 			errCh <- err
 			return
 		}
