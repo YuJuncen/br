@@ -19,7 +19,6 @@ import (
 	"github.com/pingcap/br/pkg/conn"
 	"github.com/pingcap/br/pkg/glue"
 	"github.com/pingcap/br/pkg/restore"
-	"github.com/pingcap/br/pkg/rtree"
 	"github.com/pingcap/br/pkg/storage"
 	"github.com/pingcap/br/pkg/summary"
 	"github.com/pingcap/br/pkg/utils"
@@ -420,28 +419,6 @@ func RunRestoreTiflashReplica(c context.Context, g glue.Glue, cmdName string, cf
 	// Set task summary to success status.
 	summary.SetSuccessStatus(true)
 	return nil
-}
-
-// collectRestoreResults collectes result of pipelined restore process,
-// block the current goroutine, until all the tasks finished.
-// TODO: remove this function when all the link is pipelined.
-func collectRestoreResults(
-	ctx context.Context,
-	ch <-chan restore.TableWithRange,
-	errCh <-chan error,
-) (newTables []*model.TableInfo, ranges []rtree.Range, rewriteRules *restore.RewriteRules, err error) {
-	rewriteRules = restore.EmptyRewriteRule()
-	for ct := range ch {
-		newTables = append(newTables, ct.Table)
-		ranges = append(ranges, ct.Range...)
-		rewriteRules.Table = append(rewriteRules.Table, ct.RewriteRule.Table...)
-		rewriteRules.Data = append(rewriteRules.Data, ct.RewriteRule.Data...)
-	}
-	select {
-	case err = <-errCh:
-	default:
-	}
-	return
 }
 
 // goRestore forks a goroutine to do the restore process.
