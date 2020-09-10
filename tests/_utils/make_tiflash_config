@@ -4,11 +4,6 @@ cat > tests/config/tiflash-learner.toml <<eof
 [rocksdb]
 wal-dir = ""
 
-[security]
-ca-path = ""
-cert-path = ""
-key-path = ""
-
 [server]
 addr = "0.0.0.0:20170"
 advertise-addr = "127.0.0.1:20170"

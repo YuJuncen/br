@@ -15,5 +15,5 @@
 
 set -eu
 
-echo "[$(date)] Executing SQL: $1" > "$TEST_DIR/sql_res.$TEST_NAME.txt"
+echo "[$(date)] Executing SQL: $1" >> "$TEST_DIR/sql_res.$TEST_NAME.log"
 mysql -uroot -h127.0.0.1 -P4000 --default-character-set utf8 -E -e "$1"

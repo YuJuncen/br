@@ -29,17 +29,37 @@ TIKV_COUNT=3
 TIFLASH_STATUS="127.0.0.1:17000"
 TIFLASH_HTTP="127.0.0.1:8125"
 
+install_tiup() {
+    if ! which tiup; then
+      curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+      export PATH=$PATH:$HOME/.tiup/bin
+    fi
+}
+
 stop_services() {
+    TIUP_TAG=${TEST_NAME-'br-test'}
+    killall -9 tiup || true
     killall -9 tikv-server || true
     killall -9 pd-server || true
     killall -9 tidb-server || true
     killall -9 tiflash || true
 
+    for i in $(seq 0 $(($TIKV_COUNT-1))); do
+      cp ~/.tiup/data/$TIUP_TAG/tikv-$i/tikv.log $TEST_DIR/tikv$((i+1)).log || true
+    done
+    cp ~/.tiup/data/$TIUP_TAG/tidb-0/*.log $TEST_DIR/ || true
+    cp ~/.tiup/data/$TIUP_TAG/pd-0/*.log $TEST_DIR/ || true
+    cp ~/.tiup/data/$TIUP_TAG/tiflash-0/log/*.log $TEST_DIR/ || true
     find "$TEST_DIR" -maxdepth 1 -not -path "$TEST_DIR" -not -name "*.log" | xargs rm -r || true
+    cp -r ~/.tiup/data/$TIUP_TAG/prometheus $TEST_DIR/ || true
+    rm -rf ~/.tiup/data/$TIUP_TAG
 }
 
 
 start_services() {
+    install_tiup
+    TIUP_TAG=${TEST_NAME-'br-test'}
+
     max_retry=3
     for retry_time in $(seq 1 $max_retry); do
         if start_services_impl $@; then
@@ -50,6 +70,20 @@ start_services() {
     done
     echo "Failed to start services after retry $max_retry times."
     return 1
+}
+
+tiup_ready() {
+    log=${1-tiup.log}
+
+    i=0
+    while ! grep "CLUSTER START SUCCESSFULLY" $TEST_DIR/$log; do
+        i=$((i+1))
+        if [ "$i" -gt 200 ]; then
+            echo 'Failed to bootstrap cluster'
+            return 1
+        fi
+        sleep 3
+    done
 }
 
 start_services_impl() {
@@ -64,101 +98,16 @@ start_services_impl() {
     if [ ! -e $PD_CONFIG ]; then PD_CONFIG=tests/config/pd.toml; fi
     if [ ! -e $TIFLASH_CONFIG ]; then TIFLASH_CONFIG=tests/config/tiflash.toml; fi
 
+    tiup -T $TIUP_TAG playground --pd.config $PD_CONFIG \
+      --kv.config $TIKV_CONFIG \
+      --db.config $TIDB_CONFIG \
+      --tiflash.config $TIFLASH_CONFIG \
+      --kv 3 > $TEST_DIR/tiup.log &
 
-    echo "Starting PD..."
-    mkdir -p "$TEST_DIR/pd"
-    bin/pd-server \
-        --client-urls "http://$PD_ADDR" \
-        --log-file "$TEST_DIR/pd.log" \
-        --data-dir "$TEST_DIR/pd" \
-        --config $PD_CONFIG &
-    # wait until PD is online...
-    i=0
-    while ! curl -o /dev/null -sf "http://$PD_ADDR/pd/api/v1/version"; do
-       i=$((i+1))
-       if [ "$i" -gt 20 ]; then
-          echo 'Failed to start PD'
-          return 1
-       fi
-       sleep 3
-    done
-
-    echo "Starting TiKV..."
-    for i in $(seq $TIKV_COUNT); do
-        mkdir -p "$TEST_DIR/tikv${i}"
-        bin/tikv-server \
-            --pd "$PD_ADDR" \
-            -A "$TIKV_ADDR$i" \
-            --status-addr "$TIKV_STATUS_ADDR$i" \
-            --log-file "$TEST_DIR/tikv${i}.log" \
-            -C "$TIKV_CONFIG" \
-            -s "$TEST_DIR/tikv${i}" &
-    done
-
-    echo "Waiting initializing TiKV..."
-    while ! curl -sf "http://$PD_ADDR/pd/api/v1/cluster/status" | grep '"is_initialized": true'; do
-       i=$((i+1))
-       if [ "$i" -gt 20 ]; then
-          echo 'Failed to initialize TiKV cluster'
-          return 1
-       fi
-       sleep 5
-    done
-
-    echo "Starting TiDB..."
-    bin/tidb-server \
-        -P 4000 \
-        --status 10080 \
-        --store tikv \
-        --path "$PD_ADDR" \
-        --config "$TIDB_CONFIG" \
-        --log-file "$TEST_DIR/tidb.log" &
-
-    echo "Verifying TiDB is started..."
-    i=0
-    while ! curl -o /dev/null -sf "http://$TIDB_IP:10080/status"; do
-        i=$((i+1))
-        if [ "$i" -gt 50 ]; then
-            echo 'Failed to start TiDB'
-            return 1
-        fi
-        sleep 3
-    done
-
-    if [[ ! $@ =~ "--no-tiflash" ]]; then
-        if ! start_tiflash; then
-            return 1
-        fi
-    fi
-
-    i=0
-    while ! curl "http://$PD_ADDR/pd/api/v1/cluster/status" -sf | grep -q "\"is_initialized\": true"; do
-        i=$((i+1))
-        if [ "$i" -gt 20 ]; then
-            echo 'Failed to bootstrap cluster'
-            return 1
-        fi
-        sleep 3
-    done
+    tiup_ready
 }
 
-start_tiflash() {
-    echo "Starting TiFlash..."
-    LD_LIBRARY_PATH=bin/ bin/tiflash server --config-file=$TIFLASH_CONFIG &
-    echo "TiFlash started..."
-
-    i=0
-    while ! curl -sf http://$TIFLASH_HTTP 1>/dev/null 2>&1; do
-        i=$((i+1))
-        if [ "$i" -gt 20 ]; then
-            echo "failed to start tiflash"
-            return 1
-        fi
-        echo "TiFlash seems doesn't started, retrying..."
-        sleep 3
-    done
-}
-
+# TODO when tiup playground supports TLS, use tiup to bootstrap this cluster.
 start_services_withTLS() {
     stop_services
 
